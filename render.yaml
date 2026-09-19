@@ -1,0 +1,8 @@
+# One-click setup on Render: https://render.com/deploy?repo=https://github.com/Acherchu/stax-server
+services:
+  - type: web
+    name: stax-server
+    runtime: docker
+    plan: free
+    region: ohio
+    autoDeploy: true
