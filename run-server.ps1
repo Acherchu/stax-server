@@ -5,7 +5,8 @@
 #      https address like https://some-words.trycloudflare.com that friends anywhere can reach
 #   3. writes that address into the Stax website's server.json and pushes it, so every Stax game
 #      finds the server (a new address each time the TUNNEL starts)
-#   4. keeps watching: if either one stops, it starts that one again
+#   4. keeps watching: if either one stops - OR the tunnel stops working while still running -
+#      it starts that one again and publishes the new address
 #
 # The server and the tunnel are looked after separately on purpose. The tunnel is the flaky half
 # (Cloudflare hands out quick tunnels for free and sometimes says no), and when it failed the old
@@ -13,6 +14,12 @@
 # Stax offline and made Cloudflare turn it down even harder. Now a tunnel that won't start is
 # retried on its own, waiting twice as long each time (15s ... 5 min), while the server carries on
 # running; and a server restart keeps the same tunnel address, so nothing has to be republished.
+#
+# A RUNNING TUNNEL IS NOT A WORKING TUNNEL (2026-10-11). Cloudflare revoked the quick tunnel and
+# cloudflared sat there retrying for two days - "Unauthorized: Tunnel not found", over and over -
+# without ever exiting. The watchdog only looked at whether the process had exited, so it thought
+# everything was fine while the published address answered nobody. Now the tunnel is health
+# checked as well (Test-Tunnel below), and a tunnel that is up but not working is replaced.
 #
 # Started at Windows sign-in by the "Stax Server" shortcut in the Startup folder (hidden window).
 # To stop it: Task Manager -> end "powershell" running this, "cloudflared" and "Godot".
@@ -85,7 +92,10 @@ function Start-Server {
 # address, or the process and $null if it never said one - the caller then waits a while and
 # tries again rather than thrashing.
 function Start-Tunnel {
-    Get-Process cloudflared -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $TunnelExe } | Stop-Process -Force
+    # By name as well as by path: a stuck cloudflared had left a second copy of itself behind,
+    # and leaving one running means two tunnels fighting over the same port.
+    Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
     $log = Join-Path $Logs 'tunnel.txt'
     Remove-Item -LiteralPath $log -ErrorAction SilentlyContinue
     $p = $null
@@ -109,10 +119,42 @@ function Start-Tunnel {
     return @{ Process = $p; Url = $url }
 }
 
+# Is the published address actually reachable? The game server speaks WebSocket and refuses a
+# plain HTTP request, so a WORKING tunnel answers with 502 - that counts as healthy, and so does
+# any other real answer from the origin. A tunnel Cloudflare has thrown away gives no answer at
+# all, or one of Cloudflare's own 530 / 1033 pages.
+function Test-Tunnel($url) {
+    if (-not $url) { return $false }
+    $code = 0
+    try {
+        $r = Invoke-WebRequest -Uri $url -Method Head -TimeoutSec 20 -UseBasicParsing -ErrorAction Stop
+        $code = [int]$r.StatusCode
+    } catch {
+        $resp = $_.Exception.Response
+        if ($resp -eq $null) { return $false }   # no answer: DNS gone, refused, timed out
+        try { $code = [int]$resp.StatusCode } catch { $code = 0 }
+    }
+    if ($code -eq 0) { return $false }
+    if ($code -eq 530 -or $code -eq 1033) { return $false }  # Cloudflare: origin/tunnel is gone
+    return $true
+}
+
+# cloudflared saying this means the tunnel is dead no matter how alive the process looks.
+function Test-TunnelRevoked {
+    $log = Join-Path $Logs 'tunnel.txt'
+    if (-not (Test-Path $log)) { return $false }
+    $tail = Get-Content $log -Tail 25 -ErrorAction SilentlyContinue
+    if (-not $tail) { return $false }
+    return (($tail -join "`n") -match 'Unauthorized: Tunnel not found')
+}
+
 $server = $null
 $tunnel = $null
 $address = $null
 $wait = 15  # how long to wait before trying the tunnel again, doubling up to 5 minutes
+$checkEvery = 60   # seconds between health checks of the published address
+$nextCheck = (Get-Date).AddSeconds($checkEvery)
+$sick = 0          # health checks failed in a row; 3 (or one revoked message) and it is replaced
 
 while ($true) {
     if ($server -eq $null -or $server.HasExited) {
@@ -128,6 +170,8 @@ while ($true) {
         if ($got.Url) {
             $address = $got.Url
             $wait = 15
+            $sick = 0
+            $nextCheck = (Get-Date).AddSeconds($checkEvery)
             Log "tunnel up: $address"
             Publish-Address $address
         } else {
@@ -141,6 +185,32 @@ while ($true) {
             Start-Sleep -Seconds $wait
             if ($wait -lt 300) { $wait = [Math]::Min($wait * 2, 300) }
             continue  # the game server is left running throughout
+        }
+    }
+
+    # A tunnel that is RUNNING but not WORKING is the thing that kept Stax offline for two days.
+    # One failure can be a blip, so it takes three in a row (about three minutes) - unless
+    # cloudflared has said outright that the tunnel is gone, which is believed immediately.
+    if ($tunnel -ne $null -and (Get-Date) -ge $nextCheck) {
+        $nextCheck = (Get-Date).AddSeconds($checkEvery)
+        if (Test-TunnelRevoked) {
+            Log 'cloudflared says the tunnel was revoked ("Unauthorized: Tunnel not found")'
+            $sick = 3
+        } elseif (Test-Tunnel $address) {
+            if ($sick -gt 0) { Log "the address is answering again after $sick failed check(s)" }
+            $sick = 0
+        } else {
+            $sick++
+            Log "the published address did not answer (check $sick of 3): $address"
+        }
+        if ($sick -ge 3) {
+            Log 'replacing the tunnel and publishing a new address'
+            if (-not $tunnel.HasExited) { Stop-Process -Id $tunnel.Id -Force -ErrorAction SilentlyContinue }
+            Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            $tunnel = $null
+            $address = $null
+            $sick = 0
+            continue  # the top of the loop starts a new one and publishes it
         }
     }
 
