@@ -152,7 +152,12 @@ $server = $null
 $tunnel = $null
 $address = $null
 $wait = 15  # how long to wait before trying the tunnel again, doubling up to 5 minutes
-$checkEvery = 60   # seconds between health checks of the published address
+# Each health check is a plain HTTP request the game server rightly refuses, which puts one
+# harmless "Invalid method or HTTP version" line in server-err.txt - so while all is well they
+# are kept three minutes apart. The moment one FAILS the next comes 20 s later ($checkSoon), so
+# a tunnel that has died is still spotted inside a minute.
+$checkEvery = 180  # seconds between health checks while the address is answering
+$checkSoon = 20    # seconds to the next one after a check has failed
 $nextCheck = (Get-Date).AddSeconds($checkEvery)
 $sick = 0          # health checks failed in a row; 3 (or one revoked message) and it is replaced
 
@@ -201,6 +206,7 @@ while ($true) {
             $sick = 0
         } else {
             $sick++
+            $nextCheck = (Get-Date).AddSeconds($checkSoon)  # confirm it quickly, don't wait 3 min
             Log "the published address did not answer (check $sick of 3): $address"
         }
         if ($sick -ge 3) {
