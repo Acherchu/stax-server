@@ -33,6 +33,12 @@ $Here = 'C:\Users\arche\StaxServer'
 if (-not (Test-Path $Here)) { $Here = $PSScriptRoot }
 $Godot = 'C:\Users\arche\dev-tools\godot-4.7.2\Godot_v4.7.2-stable_win64_console.exe'
 $Pack = Join-Path $Here 'stax-server.pck'
+# The server runs from a COPY. Re-exporting stax-server.pck while a server is live changes the
+# bytes under its open handle, and every resource it hasn't loaded yet then fails - rooms open
+# but no game ever starts ("Cannot open file res://games/.../x.tscn"). That is exactly what took
+# multiplayer down on 2026-10-11. The copy is made fresh at every start, so a re-export only ever
+# takes effect on the next restart, which is what you want anyway.
+$RunPack = Join-Path $Here 'stax-server-running.pck'
 # NEVER call this $tunnel: the loop keeps the running tunnel in $tunnel, and PowerShell treats the
 # two as ONE variable (names ignore case) - that wiped the path and cloudflared could never start
 # again after the first restart. That was the "can't reach the Stax server" outage.
@@ -74,8 +80,14 @@ function Start-Server {
         Where-Object { $_.CommandLine -like '*stax-server.pck*' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 2
+    try {
+        Copy-Item -LiteralPath $Pack -Destination $RunPack -Force -ErrorAction Stop
+    } catch {
+        Log "WARNING: couldn't copy the pack ($($_.Exception.Message)) - running the original"
+        $RunPack = $Pack
+    }
     $p = Start-Process -FilePath $Godot -WindowStyle Hidden -PassThru `
-        -ArgumentList @('--headless', '--main-pack', "`"$Pack`"", '--', '--server', "--port=$Port", '--bind=127.0.0.1') `
+        -ArgumentList @('--headless', '--main-pack', "`"$RunPack`"", '--', '--server', "--port=$Port", '--bind=127.0.0.1') `
         -RedirectStandardOutput (Join-Path $Logs 'server-out.txt') `
         -RedirectStandardError (Join-Path $Logs 'server-err.txt')
     Start-Sleep -Seconds 3
